@@ -1,0 +1,1170 @@
+/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+
+#include <fluent-bit/flb_compat.h>
+#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_mem.h>
+#include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_mp.h>
+#include <fluent-bit/flb_mp_chunk.h>
+#include <fluent-bit/flb_mp_preflight.h>
+#include <fluent-bit/flb_log_event_encoder.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <msgpack.h>
+#include <ctraces/ctraces.h>
+
+#include "flb_tests_internal.h"
+
+
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#define APACHE_10K    FLB_TESTS_DATA_PATH "/data/mp/apache_10k.mp"
+
+void test_count()
+{
+    int ret;
+    int count;
+    char *data;
+    size_t len;
+    struct stat st;
+
+    ret = stat(APACHE_10K, &st);
+    if (ret == -1) {
+        exit(1);
+    }
+    len = st.st_size;
+
+    data = mk_file_to_buffer(APACHE_10K);
+    TEST_CHECK(data != NULL);
+
+    count = flb_mp_count(data, len);
+    TEST_CHECK(count == 10000);
+    flb_free(data);
+}
+
+void test_map_header()
+{
+    int i;
+    int ret;
+    size_t off = 0;
+    msgpack_packer mp_pck;
+    msgpack_object root;
+    msgpack_sbuffer mp_sbuf;
+    msgpack_unpacked result;
+    struct flb_mp_map_header mh;
+
+    msgpack_sbuffer_init(&mp_sbuf);
+    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+
+    /* Init map header */
+    flb_mp_map_header_init(&mh, &mp_pck);
+
+    /* Append 1000 items */
+    for (i = 0; i < 100; i++) {
+        flb_mp_map_header_append(&mh);
+        msgpack_pack_str(&mp_pck, 3);
+        msgpack_pack_str_body(&mp_pck, "key", 3);
+        msgpack_pack_uint64(&mp_pck, i);
+    }
+    flb_mp_map_header_end(&mh);
+
+    /* Unpack and check */
+    msgpack_unpacked_init(&result);
+    ret = msgpack_unpack_next(&result, mp_sbuf.data, mp_sbuf.size, &off);
+    TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS);
+
+    root = result.data;
+    TEST_CHECK(root.type == MSGPACK_OBJECT_MAP);
+    TEST_CHECK(root.via.array.size == 100);
+
+    msgpack_unpacked_destroy(&result);
+    msgpack_sbuffer_destroy(&mp_sbuf);
+}
+
+void test_accessor_keys_remove()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *buf;
+    size_t size;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_mp_accessor *mpa;
+    struct mk_list patterns;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\","
+        "                       \"extra\": false"
+        "}}]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &buf, &size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack the content */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf, size, &off);
+    map = result.data;
+
+    /* Create list of patterns */
+    flb_slist_create(&patterns);
+    flb_slist_add(&patterns, "$kubernetes[2]['annotations']['fluentbit.io/tag']");
+    flb_slist_add(&patterns, "$key1");
+
+    /* Create mp accessor */
+    mpa = flb_mp_accessor_create(&patterns);
+    TEST_CHECK(mpa != NULL);
+
+    /* Remove the entry that matches the pattern(s) */
+    ret = flb_mp_accessor_keys_remove(mpa, &map, (void *) &out_buf, &out_size);
+    TEST_CHECK(ret == FLB_TRUE);
+
+    printf("\n=== ORIGINAL  ===\n");
+    flb_pack_print(buf, size);
+    flb_free(buf);
+
+    printf("=== FINAL MAP ===\n");
+    if (ret == FLB_TRUE) {
+        flb_pack_print(out_buf, out_size);
+        flb_free(out_buf);
+    }
+
+    flb_mp_accessor_destroy(mpa);
+    flb_slist_destroy(&patterns);
+    msgpack_unpacked_destroy(&result);
+}
+
+/* https://github.com/fluent/fluent-bit/issues/5546 */
+void test_keys_remove_subkey_key()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *buf;
+    size_t size;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char final_json[2048] = {0};
+    msgpack_unpacked result;
+    msgpack_unpacked result_final;
+    msgpack_object map;
+    struct flb_mp_accessor *mpa;
+    struct mk_list patterns;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\","
+        "                       \"extra\": false"
+        "}}]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &buf, &size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack the content */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf, size, &off);
+    map = result.data;
+
+    /* Create list of patterns */
+    flb_slist_create(&patterns);
+
+    /* sub key -> key */
+    flb_slist_add(&patterns, "$kubernetes[2]['annotations']['fluentbit.io/tag']");
+    flb_slist_add(&patterns, "$kubernetes");
+
+
+    /* Create mp accessor */
+    mpa = flb_mp_accessor_create(&patterns);
+    TEST_CHECK(mpa != NULL);
+
+    /* Remove the entry that matches the pattern(s) */
+    ret = flb_mp_accessor_keys_remove(mpa, &map, (void *) &out_buf, &out_size);
+    TEST_CHECK(ret == FLB_TRUE);
+
+    printf("\n=== ORIGINAL  ===\n");
+    flb_pack_print(buf, size);
+    flb_free(buf);
+
+    printf("=== FINAL MAP ===\n");
+    if (ret == FLB_TRUE) {
+        flb_pack_print(out_buf, out_size);
+    }
+    msgpack_unpacked_destroy(&result);
+
+    off = 0;
+    msgpack_unpacked_init(&result_final);
+    msgpack_unpack_next(&result_final, out_buf, out_size, &off);
+    flb_msgpack_to_json(&final_json[0], sizeof(final_json), &result_final.data, FLB_TRUE);
+
+    if (!TEST_CHECK(strstr(&final_json[0] ,"kubernetes") == NULL)) {
+        TEST_MSG("kubernetes field should be removed");
+    }
+
+    msgpack_unpacked_destroy(&result_final);
+
+    flb_free(out_buf);
+    flb_mp_accessor_destroy(mpa);
+    flb_slist_destroy(&patterns);
+
+}
+
+void test_remove_sibling_subkeys()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *buf;
+    size_t size;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char final_json[2048] = {0};
+    msgpack_unpacked result;
+    msgpack_unpacked result_final;
+    msgpack_object map;
+    struct flb_mp_accessor *mpa;
+    struct mk_list patterns;
+
+    /* Sample JSON message */
+    json =
+        "{"
+        "\"kubernetes\": {"
+            "\"pod_id\": \"id\","
+            "\"pod_name\": \"name\","
+            "\"host\": \"localhost\","
+            "\"labels\": {"
+                "\"app\": \"myapp\","
+                "\"tier\": \"backend\""
+            "}"
+        "},"
+        "\"msg\": \"kernel panic\""
+        "}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &buf, &size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack the content */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf, size, &off);
+    map = result.data;
+
+    /* Create list of patterns */
+    flb_slist_create(&patterns);
+
+    /* sub key -> key */
+    flb_slist_add(&patterns, "$kubernetes['pod_name']");
+    flb_slist_add(&patterns, "$kubernetes['foo']");
+    flb_slist_add(&patterns, "$kubernetes['pod_id']");
+    flb_slist_add(&patterns, "$kubernetes['labels']['tier']");
+    flb_slist_add(&patterns, "$time");
+
+
+    /* Create mp accessor */
+    mpa = flb_mp_accessor_create(&patterns);
+    TEST_CHECK(mpa != NULL);
+
+    /* Remove the entry that matches the pattern(s) */
+    ret = flb_mp_accessor_keys_remove(mpa, &map, (void *) &out_buf, &out_size);
+    TEST_CHECK(ret == FLB_TRUE);
+
+    printf("\n=== ORIGINAL  ===\n");
+    flb_pack_print(buf, size);
+    flb_free(buf);
+
+    printf("=== FINAL MAP ===\n");
+    if (ret == FLB_TRUE) {
+        flb_pack_print(out_buf, out_size);
+    }
+    msgpack_unpacked_destroy(&result);
+
+    off = 0;
+    msgpack_unpacked_init(&result_final);
+    msgpack_unpack_next(&result_final, out_buf, out_size, &off);
+    flb_msgpack_to_json(&final_json[0], sizeof(final_json), &result_final.data, FLB_TRUE);
+
+    if (!TEST_CHECK(strstr(&final_json[0] ,"pod_id") == NULL)) {
+        TEST_MSG("pod_id field should be removed");
+    }
+    if (!TEST_CHECK(strstr(&final_json[0] ,"pod_name") == NULL)) {
+        TEST_MSG("pod_name field should be removed");
+    }
+    if (!TEST_CHECK(strstr(&final_json[0] ,"tier") == NULL)) {
+        TEST_MSG("tier field should be removed");
+    }
+    if (!TEST_CHECK(strstr(&final_json[0] ,"app") != NULL)) {
+        TEST_MSG("app field should not be removed");
+    }
+
+    msgpack_unpacked_destroy(&result_final);
+
+    flb_free(out_buf);
+    flb_mp_accessor_destroy(mpa);
+    flb_slist_destroy(&patterns);
+
+}
+
+void remove_subkey_keys(char *list[], int list_size, int index_start)
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *buf;
+    size_t size;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char final_json[2048] = {0};
+    msgpack_unpacked result;
+    msgpack_unpacked result_final;
+    msgpack_object map;
+    struct flb_mp_accessor *mpa;
+    struct mk_list patterns;
+    int i;
+    int count = 0;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\","
+        "                       \"extra\": false"
+        "}}]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &buf, &size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack the content */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf, size, &off);
+    map = result.data;
+
+    /* Create list of patterns */
+    flb_slist_create(&patterns);
+
+    /* sub keys */
+    for (i=index_start; count<list_size; i++) {
+        if (i>=list_size) {
+            i = 0;
+        }
+        flb_slist_add(&patterns, list[i]);
+        count++;
+    }
+
+    /* Create mp accessor */
+    mpa = flb_mp_accessor_create(&patterns);
+    TEST_CHECK(mpa != NULL);
+
+    /* Remove the entry that matches the pattern(s) */
+    ret = flb_mp_accessor_keys_remove(mpa, &map, (void *) &out_buf, &out_size);
+    TEST_CHECK(ret == FLB_TRUE);
+
+    printf("\n=== ORIGINAL  ===\n");
+    flb_pack_print(buf, size);
+    flb_free(buf);
+
+    printf("=== FINAL MAP ===\n");
+    if (ret == FLB_TRUE) {
+        flb_pack_print(out_buf, out_size);
+    }
+    msgpack_unpacked_destroy(&result);
+
+    off = 0;
+    msgpack_unpacked_init(&result_final);
+    msgpack_unpack_next(&result_final, out_buf, out_size, &off);
+    flb_msgpack_to_json(&final_json[0], sizeof(final_json), &result_final.data, FLB_TRUE);
+
+    if (!TEST_CHECK(strstr(&final_json[0] ,"kubernetes") == NULL)) {
+        TEST_MSG("kubernetes field should be removed");
+    }
+
+    msgpack_unpacked_destroy(&result_final);
+
+    flb_free(out_buf);
+    flb_mp_accessor_destroy(mpa);
+    flb_slist_destroy(&patterns);
+}
+
+void test_keys_remove_subkey_keys()
+{
+    char *list[] = {"$kubernetes[2]['annotations']['fluentbit.io/tag']",
+                    "$kubernetes[2]['a']",
+                    "$kubernetes"};
+    char *list2[] = {"$kubernetes[2]['annotations']['fluentbit.io/tag']",
+                     "$kubernetes",
+                     "$kubernetes[2]['a']"};
+
+    int size = sizeof(list)/sizeof(char*);
+    int i;
+
+    for (i=0; i<size; i++) {
+        remove_subkey_keys(list, size, i);
+    }
+    for (i=0; i<size; i++) {
+        remove_subkey_keys(list2, size, i);
+    }
+}
+
+void test_object_to_cfl_to_msgpack()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *buf;
+    size_t size;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char final_json[2048] = {0};
+    msgpack_unpacked result;
+    msgpack_unpacked result_final;
+    msgpack_object map;
+    struct flb_mp_accessor *mpa;
+    struct cfl_object *obj;
+    struct mk_list patterns;
+    flb_sds_t buf1;
+    flb_sds_t buf2;
+
+    /* Sample JSON message */
+    json =
+        "{\"key1\": \"something\", "
+        "\"kubernetes\": "
+        "   [true, "
+        "    false, "
+        "    null, "
+        "    -10,"
+        "    123456,"
+        "    789.123,"
+        "    {\"a\": false, "
+        "     \"annotations\": { "
+        "                       \"fluentbit.io/tag\": \"thetag\","
+        "                       \"extra\": false"
+        "}}]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &buf, &size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    printf("\n");
+    printf("\n>> original JSON in msgpack:\n");
+    flb_pack_print(buf, size);
+
+    /* Unpack msgpack to get a msgpack object, and convert it to CFL */
+    /* Unpack the content */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, buf, size, &off);
+    map = result.data;
+
+    obj = flb_mp_object_to_cfl(&map);
+    TEST_CHECK(obj != NULL);
+
+    /* Print the CFL object*/
+    printf("\n>> CFL print:\n");
+    cfl_object_print(stdout, obj);
+
+    /* Convert back the CFL Object to a msgpack buffer. */
+    ret = flb_mp_cfl_to_msgpack(obj, &out_buf, &out_size);
+    TEST_CHECK(ret == 0);
+
+    /* Print msgpack */
+
+    printf("\n>> CFL to msgpack content:\n");
+    flb_pack_print(out_buf, out_size);
+
+    /*
+     * Convert buf (msgpack 1 buffer) to JSON, and compare the strings
+     * generated by out_buf (msgpack 2 buffer). They must match.
+     */
+    buf1 = flb_msgpack_raw_to_json_sds(buf, size, FLB_TRUE);
+    buf2 = flb_msgpack_raw_to_json_sds(out_buf, out_size, FLB_TRUE);
+
+    ret = strcmp(buf1, buf2);
+    printf("\n>> Compare JSON buf1 v/s JSON buf2 (ret=%i):\n", ret);
+    TEST_CHECK(ret == 0);
+    printf("[buf1]: %s\n", buf1);
+    printf("[buf2]: %s\n\n", buf2);
+
+    flb_sds_destroy(buf1);
+    flb_sds_destroy(buf2);
+
+    msgpack_unpacked_destroy(&result);
+    flb_free(buf);
+    flb_free(out_buf);
+
+    cfl_object_destroy(obj);
+}
+
+void test_validate_trace_chunk()
+{
+    int codes[] = {0, 1, 2, -2147483647 - 1, -1, 3, 2147483647};
+    int ret;
+    int count;
+    size_t index;
+    size_t size;
+    size_t processed;
+    char *packed;
+    char invalid = '\xc1';
+    msgpack_sbuffer buffer;
+    struct ctrace *trace;
+    struct ctrace_resource_span *resource;
+    struct ctrace_scope_span *scope;
+    struct ctrace_span *span;
+
+    msgpack_sbuffer_init(&buffer);
+    for (index = 0; index < sizeof(codes) / sizeof(codes[0]); index++) {
+        trace = ctr_create(NULL);
+        TEST_ASSERT(trace != NULL);
+        resource = ctr_resource_span_create(trace);
+        TEST_ASSERT(resource != NULL);
+        scope = ctr_scope_span_create(resource);
+        TEST_ASSERT(scope != NULL);
+        span = ctr_span_create(trace, scope, "trace", NULL);
+        TEST_ASSERT(span != NULL);
+        TEST_ASSERT(ctr_span_set_status(span, codes[index], "message") == 0);
+        TEST_ASSERT(ctr_encode_msgpack_create(trace, &packed, &size) == 0);
+        TEST_ASSERT(msgpack_sbuffer_write(&buffer, packed, size) == 0);
+        ctr_encode_msgpack_destroy(packed);
+        ctr_destroy(trace);
+    }
+
+    ret = flb_mp_validate_trace_chunk(buffer.data, buffer.size, &count, &processed);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(count == 7);
+    TEST_CHECK(processed == buffer.size);
+
+    ret = flb_mp_validate_trace_chunk(buffer.data, buffer.size - 1, &count, &processed);
+    TEST_CHECK(ret == -1);
+    TEST_CHECK(count == 6);
+    TEST_CHECK(processed < buffer.size - 1);
+
+    TEST_ASSERT(msgpack_sbuffer_write(&buffer, &invalid, 1) == 0);
+    ret = flb_mp_validate_trace_chunk(buffer.data, buffer.size, &count, &processed);
+    TEST_CHECK(ret == -1);
+    TEST_CHECK(count == 7);
+    TEST_CHECK(processed == buffer.size - 1);
+
+    ret = flb_mp_validate_trace_chunk(&invalid, 1, &count, &processed);
+    TEST_CHECK(ret == -1);
+    TEST_CHECK(count == 0);
+    TEST_CHECK(processed == 0);
+
+    ret = flb_mp_validate_trace_chunk(NULL, 0, &count, &processed);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(count == 0);
+    TEST_CHECK(processed == 0);
+    msgpack_sbuffer_destroy(&buffer);
+}
+
+/* Budget checks must run before msgpack-c sees attacker-controlled counts. */
+static void test_preflight(void)
+{
+    struct flb_mp_preflight *scan;
+    size_t consumed;
+    size_t cost;
+    size_t required;
+    size_t i;
+    int ret;
+    char deep[MSGPACK_EMBED_STACK_SIZE + 1];
+    char large_string[16387];
+    const char array[] = "\xdd\xff\xff\xff\xff";
+    const char map[] = "\xdf\xff\xff\xff\xff";
+    const char valid[] = "\x92\x01\x81\xa1k\x02";
+    const char nested[] = "\x92\xdd\x00\x00\x00\x64";
+    const char invalid[] = "\xc1";
+    const char sequence[] = "\x91\x01\x91\x02";
+    const char long_string[] = "\xdb\xff\xff\xff\xff";
+
+    scan = flb_mp_preflight_create(6144000, 6144000);
+    TEST_ASSERT(scan != NULL);
+    ret = flb_mp_preflight_scan(scan, array, 5, &consumed, &cost);
+    TEST_CHECK(ret == -1);
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, map, 5, &consumed, &cost) == -1);
+
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, array, 2, &consumed, &cost) == 0);
+    TEST_CHECK(flb_mp_preflight_scan(scan, array, 5, &consumed, &cost) == -1);
+
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    for (i = 1; i < sizeof(valid); i++) {
+        ret = flb_mp_preflight_scan(scan, valid, i, &consumed, &cost);
+        TEST_CHECK(ret == (i == sizeof(valid) - 1 ? 1 : 0));
+    }
+    required = cost;
+    TEST_CHECK(consumed == sizeof(valid) - 1);
+    TEST_CHECK(required >= MSGPACK_ZONE_CHUNK_SIZE);
+    flb_mp_preflight_reset(scan, required, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, valid, sizeof(valid) - 1, &consumed, &cost) == 1);
+    flb_mp_preflight_reset(scan, required - 1, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, valid, sizeof(valid) - 1, &consumed, &cost) == -1);
+
+    flb_mp_preflight_reset(scan, 128, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, nested, sizeof(nested) - 1, &consumed, &cost) == -1);
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    memset(deep, 0x91, sizeof(deep));
+    TEST_CHECK(flb_mp_preflight_scan(scan, deep, sizeof(deep), &consumed, &cost) == -1);
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, invalid, 1, &consumed, &cost) == -1);
+    TEST_CHECK(flb_mp_preflight_sequence(valid, sizeof(valid) - 1, required) == 0);
+    TEST_CHECK(flb_mp_preflight_sequence(valid, sizeof(valid) - 2, required) == -1);
+    TEST_CHECK(flb_mp_preflight_sequence(array, 5, 6144000) == -1);
+    TEST_CHECK(flb_mp_preflight_sequence(sequence, sizeof(sequence) - 1, required) == -1);
+    TEST_CHECK(flb_mp_preflight_sequence(sequence, sizeof(sequence) - 1, 2 * required) == 0);
+    TEST_CHECK(flb_mp_preflight_sequence_limited(sequence, sizeof(sequence) - 1,
+                                                  2 * required, 3) == -1);
+    TEST_CHECK(flb_mp_preflight_sequence_limited(sequence, sizeof(sequence) - 1,
+                                                  2 * required, 4) == 0);
+    flb_mp_preflight_reset(scan, 6144000, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, long_string, 5, &consumed, &cost) == -1);
+    memset(large_string, 'a', sizeof(large_string));
+    large_string[0] = (char) 0xda;
+    large_string[1] = 0x40;
+    large_string[2] = 0;
+    flb_mp_preflight_reset(scan, required, sizeof(large_string));
+    TEST_CHECK(flb_mp_preflight_scan(scan, large_string, sizeof(large_string),
+                                     &consumed, &cost) == 1);
+    flb_mp_preflight_reset(scan, required, sizeof(large_string) - 1);
+    TEST_CHECK(flb_mp_preflight_scan(scan, large_string, sizeof(large_string),
+                                     &consumed, &cost) == -1);
+    flb_mp_preflight_destroy(scan);
+}
+
+static void test_preflight_formats(void)
+{
+    struct flb_mp_preflight *scan;
+    msgpack_sbuffer buffer;
+    msgpack_packer packer;
+    msgpack_unpacked result;
+    size_t consumed;
+    size_t cost;
+    size_t offset;
+    size_t i;
+    size_t limit;
+    int ret;
+    char bytes[300];
+
+    memset(bytes, 'a', sizeof(bytes));
+    scan = flb_mp_preflight_create(6144000, 6144000);
+    TEST_ASSERT(scan != NULL);
+    msgpack_sbuffer_init(&buffer);
+    msgpack_packer_init(&packer, &buffer, msgpack_sbuffer_write);
+    msgpack_pack_array(&packer, 20);
+    msgpack_pack_nil(&packer);
+    msgpack_pack_true(&packer);
+    msgpack_pack_false(&packer);
+    msgpack_pack_uint8(&packer, 200);
+    msgpack_pack_uint16(&packer, 1000);
+    msgpack_pack_uint32(&packer, 100000);
+    msgpack_pack_uint64(&packer, UINT64_MAX);
+    msgpack_pack_int8(&packer, -100);
+    msgpack_pack_int16(&packer, -1000);
+    msgpack_pack_int32(&packer, -100000);
+    msgpack_pack_int64(&packer, INT64_MIN);
+    msgpack_pack_float(&packer, 1.5);
+    msgpack_pack_double(&packer, 2.5);
+    msgpack_pack_str(&packer, sizeof(bytes));
+    msgpack_pack_str_body(&packer, bytes, sizeof(bytes));
+    msgpack_pack_bin(&packer, sizeof(bytes));
+    msgpack_pack_bin_body(&packer, bytes, sizeof(bytes));
+    msgpack_pack_ext(&packer, sizeof(bytes), 1);
+    msgpack_pack_ext_body(&packer, bytes, sizeof(bytes));
+    msgpack_pack_ext(&packer, 0, 1);
+    msgpack_pack_ext(&packer, 8, 0);
+    msgpack_pack_ext_body(&packer, bytes, 8);
+    msgpack_pack_map(&packer, 0);
+    msgpack_pack_array(&packer, 2000);
+    for (i = 0; i < 2000; i++) {
+        msgpack_pack_map(&packer, 1);
+        msgpack_pack_str(&packer, 1);
+        msgpack_pack_str_body(&packer, "k", 1);
+        msgpack_pack_nil(&packer);
+    }
+    for (i = 1; i <= buffer.size; i++) {
+        ret = flb_mp_preflight_scan(scan, buffer.data, i, &consumed, &cost);
+        TEST_CHECK(ret == (i == buffer.size ? 1 : 0));
+    }
+    TEST_CHECK(consumed == buffer.size);
+    limit = cost;
+    TEST_CHECK(limit > MSGPACK_ZONE_CHUNK_SIZE);
+    flb_mp_preflight_reset(scan, limit, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, buffer.data, buffer.size, &consumed, &cost) == 1);
+    flb_mp_preflight_reset(scan, limit - 1, 6144000);
+    TEST_CHECK(flb_mp_preflight_scan(scan, buffer.data, buffer.size, &consumed, &cost) == -1);
+    msgpack_unpacked_init(&result);
+    offset = 0;
+    TEST_CHECK(msgpack_unpack_next(&result, buffer.data, buffer.size, &offset) ==
+               MSGPACK_UNPACK_SUCCESS);
+    TEST_CHECK(offset == buffer.size);
+    msgpack_unpacked_destroy(&result);
+    msgpack_sbuffer_destroy(&buffer);
+    flb_mp_preflight_destroy(scan);
+}
+
+/* Compare optimized counts with the authoritative decoder, including every
+ * truncated prefix and byte corruption of grouped and ordinary records. */
+static int reference_log_count(const char *data, size_t size)
+{
+    struct flb_log_event_decoder decoder;
+    struct flb_log_event event;
+    int count = 0;
+
+    if (flb_log_event_decoder_init(&decoder, (char *) data, size) != 0) {
+        return 0;
+    }
+    while (flb_log_event_decoder_next(&decoder, &event) == 0) {
+        count++;
+    }
+    flb_log_event_decoder_destroy(&decoder);
+    return count;
+}
+
+/* a processor that drops every record leaves an empty, NULL buffer */
+static void test_log_helpers_accept_empty_buffers(void)
+{
+    int count;
+    int records;
+    char *out_buf;
+    size_t out_size;
+    size_t window_end;
+
+    count = -1;
+    TEST_CHECK(flb_mp_scan_log_records(NULL, 0, &count) == 0 && count == 0);
+    TEST_CHECK(flb_mp_scan_log_records(NULL, 1, &count) == -1);
+    TEST_CHECK(flb_mp_count_log_records(NULL, 0) == 0);
+    TEST_CHECK(flb_mp_log_group_boundaries(NULL, 0) == 0);
+    TEST_CHECK(flb_mp_log_group_starts(NULL, 0) == 0);
+    TEST_CHECK(flb_mp_log_window_next(NULL, 0, 0, 65536, 1024,
+                                      &window_end, &records) == -1);
+
+    out_buf = (char *) 1;
+    out_size = 1;
+    TEST_CHECK(flb_mp_normalize_log_buffer_groups_msgpack_ex(NULL, 0, &out_buf, &out_size,
+                                                             FLB_MP_GROUPS_KEEP_LEADING_END |
+                                                             FLB_MP_GROUPS_KEEP_TRAILING_OPEN) == 0);
+    TEST_CHECK(out_buf == NULL && out_size == 0);
+}
+
+static void test_log_scan_matches_decoder(void)
+{
+    struct flb_log_event_encoder *encoder;
+    struct flb_time timestamp;
+    size_t length;
+    size_t index;
+    int ret;
+    int count;
+    int record;
+    char saved;
+
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    for (record = 0; record < 4; record++) {
+        if (record == 1) {
+            TEST_ASSERT(flb_log_event_encoder_group_init(encoder) == 0);
+            TEST_ASSERT(flb_log_event_encoder_group_header_end(encoder) == 0);
+        }
+        TEST_ASSERT(flb_log_event_encoder_begin_record(encoder) == 0);
+        flb_time_set(&timestamp, 1700000000 + record, record);
+        TEST_ASSERT(flb_log_event_encoder_set_timestamp(encoder, &timestamp) == 0);
+        ret = flb_log_event_encoder_append_body_values(encoder,
+            FLB_LOG_EVENT_CSTRING_VALUE("key"), FLB_LOG_EVENT_CSTRING_VALUE("value"));
+        TEST_ASSERT(ret == 0);
+        TEST_ASSERT(flb_log_event_encoder_commit_record(encoder) == 0);
+        if (record == 2) {
+            TEST_ASSERT(flb_log_event_encoder_group_end(encoder) == 0);
+        }
+    }
+    TEST_CHECK(flb_mp_scan_log_records(encoder->output_buffer, encoder->output_length,
+                                      &count) == 0);
+    TEST_CHECK(count == 4);
+    for (length = 0; length <= encoder->output_length; length++) {
+        TEST_CHECK(flb_mp_count_log_records(encoder->output_buffer, length) ==
+                   reference_log_count(encoder->output_buffer, length));
+    }
+    for (index = 0; index < encoder->output_length; index++) {
+        saved = encoder->output_buffer[index];
+        encoder->output_buffer[index] = (char) 0xc1;
+        TEST_CHECK(flb_mp_count_log_records(encoder->output_buffer, encoder->output_length) ==
+                   reference_log_count(encoder->output_buffer, encoder->output_length));
+        encoder->output_buffer[index] = saved;
+
+        /*
+         * Leave the counts of 16 and 32 bit array and map headers intact: a
+         * corrupted count makes the msgpack-c fallback request gigabytes.
+         */
+        if ((unsigned char) saved == 0xdc || (unsigned char) saved == 0xde) {
+            index += 2;
+        }
+        else if ((unsigned char) saved == 0xdd || (unsigned char) saved == 0xdf) {
+            index += 4;
+        }
+    }
+    flb_log_event_encoder_destroy(encoder);
+}
+
+static void append_window_test_record(struct flb_log_event_encoder *encoder, int seq)
+{
+    int ret;
+    struct flb_time timestamp;
+
+    TEST_ASSERT(flb_log_event_encoder_begin_record(encoder) == 0);
+    flb_time_set(&timestamp, 1700000000 + seq, 0);
+    TEST_ASSERT(flb_log_event_encoder_set_timestamp(encoder, &timestamp) == 0);
+    ret = flb_log_event_encoder_append_body_values(encoder,
+        FLB_LOG_EVENT_CSTRING_VALUE("seq"), FLB_LOG_EVENT_INT64_VALUE(seq));
+    TEST_ASSERT(ret == 0);
+    TEST_ASSERT(flb_log_event_encoder_commit_record(encoder) == 0);
+}
+
+static void test_log_window_next(void)
+{
+    struct flb_log_event_encoder *encoder;
+    size_t offset;
+    size_t end;
+    size_t group_start;
+    size_t group_end;
+    int records;
+    int total;
+    int windows;
+    int seq;
+
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+
+    /* 10 plain records, a group of 6 records, 4 plain records */
+    for (seq = 0; seq < 10; seq++) {
+        append_window_test_record(encoder, seq);
+    }
+    group_start = encoder->output_length;
+    TEST_ASSERT(flb_log_event_encoder_group_init(encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_group_header_end(encoder) == 0);
+    for (; seq < 16; seq++) {
+        append_window_test_record(encoder, seq);
+    }
+    TEST_ASSERT(flb_log_event_encoder_group_end(encoder) == 0);
+    group_end = encoder->output_length;
+    for (; seq < 20; seq++) {
+        append_window_test_record(encoder, seq);
+    }
+
+    /* record limited windows cover the buffer without splitting the group */
+    offset = 0;
+    total = 0;
+    windows = 0;
+    while (offset < encoder->output_length) {
+        TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer,
+                                           encoder->output_length, offset,
+                                           SIZE_MAX, 4, &end, &records) == 0);
+        TEST_CHECK(end > offset && end <= encoder->output_length);
+        TEST_CHECK(!(offset < group_start && end > group_start && end < group_end));
+        TEST_CHECK(!(offset > group_start && offset < group_end));
+        TEST_CHECK(flb_mp_count_log_records(encoder->output_buffer + offset,
+                                            end - offset) == records);
+        if (end <= group_start || offset >= group_end) {
+            TEST_CHECK(records <= 4);
+        }
+        total += records;
+        windows++;
+        offset = end;
+    }
+    TEST_CHECK(offset == encoder->output_length);
+    TEST_CHECK(total == 20);
+    /* 4 + 4 + (2 plain and the whole group of 6) + 4 */
+    TEST_CHECK(windows == 4);
+
+    /* a byte limit of one closes after every event outside the group */
+    TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                       0, 1, INT_MAX, &end, &records) == 0);
+    TEST_CHECK(records == 1);
+    TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                       group_start, 1, INT_MAX, &end, &records) == 0);
+    TEST_CHECK(end == group_end && records == 6);
+    TEST_CHECK(flb_mp_log_group_starts(encoder->output_buffer + group_start,
+                                       group_end - group_start) == 1);
+
+    /* a single window for the whole buffer */
+    TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                       0, SIZE_MAX, INT_MAX, &end, &records) == 0);
+    TEST_CHECK(end == encoder->output_length && records == 20);
+
+    /* invalid input and offsets */
+    TEST_CHECK(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                      encoder->output_length, 1, 1, &end, &records) == -1);
+    TEST_CHECK(flb_mp_log_window_next(NULL, 10, 0, 1, 1, &end, &records) == -1);
+    TEST_CHECK(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length - 1,
+                                      0, SIZE_MAX, INT_MAX, &end, &records) == -1);
+    TEST_CHECK(flb_mp_log_window_next("\x92\x01", 2, 0, 1, 1, &end, &records) == -1);
+
+    flb_log_event_encoder_destroy(encoder);
+
+    /* a full window keeps a following end marker instead of starting with it */
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    for (seq = 0; seq < 4; seq++) {
+        append_window_test_record(encoder, seq);
+    }
+    TEST_ASSERT(flb_log_event_encoder_group_end(encoder) == 0);
+    group_end = encoder->output_length;
+    TEST_ASSERT(flb_log_event_encoder_group_init(encoder) == 0);
+    TEST_ASSERT(flb_log_event_encoder_group_header_end(encoder) == 0);
+    append_window_test_record(encoder, seq);
+    TEST_ASSERT(flb_log_event_encoder_group_end(encoder) == 0);
+
+    TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                       0, SIZE_MAX, 4, &end, &records) == 0);
+    TEST_CHECK(end == group_end && records == 4);
+    TEST_ASSERT(flb_mp_log_window_next(encoder->output_buffer, encoder->output_length,
+                                       end, SIZE_MAX, 4, &end, &records) == 0);
+    TEST_CHECK(end == encoder->output_length && records == 1);
+
+    flb_log_event_encoder_destroy(encoder);
+}
+
+/* layout tokens: r<n> record, S group start, E group end */
+static void encode_group_layout(struct flb_log_event_encoder *encoder, const char *layout)
+{
+    int length;
+    char token[16];
+    const char *cursor;
+
+    for (cursor = layout; sscanf(cursor, "%15s%n", token, &length) == 1; cursor += length) {
+        if (token[0] == 'r') {
+            append_window_test_record(encoder, atoi(token + 1));
+        }
+        else if (token[0] == 'S') {
+            TEST_CHECK(flb_log_event_encoder_group_init(encoder) == 0);
+            TEST_CHECK(flb_log_event_encoder_group_header_end(encoder) == 0);
+        }
+        else {
+            TEST_CHECK(flb_log_event_encoder_group_end(encoder) == 0);
+        }
+    }
+}
+
+static void describe_group_layout(char *buf, size_t size, char *out, size_t out_size)
+{
+    int type;
+    char token[16];
+    msgpack_object *seq;
+    struct flb_log_event event;
+    struct flb_log_event_decoder decoder;
+
+    out[0] = '\0';
+    if (buf == NULL || size == 0) {
+        return;
+    }
+
+    TEST_ASSERT(flb_log_event_decoder_init(&decoder, buf, size) == 0);
+    flb_log_event_decoder_read_groups(&decoder, FLB_TRUE);
+    while (flb_log_event_decoder_next(&decoder, &event) == FLB_EVENT_DECODER_SUCCESS) {
+        TEST_ASSERT(flb_log_event_decoder_get_record_type(&event, &type) == 0);
+        if (type == FLB_LOG_EVENT_GROUP_START) {
+            snprintf(token, sizeof(token), "S ");
+        }
+        else if (type == FLB_LOG_EVENT_GROUP_END) {
+            snprintf(token, sizeof(token), "E ");
+        }
+        else {
+            seq = &event.body->via.map.ptr[0].val;
+            snprintf(token, sizeof(token), "r%d ", (int) seq->via.i64);
+        }
+        strncat(out, token, out_size - strlen(out) - 1);
+    }
+    flb_log_event_decoder_destroy(&decoder);
+    if (strlen(out) > 0) {
+        out[strlen(out) - 1] = '\0';
+    }
+}
+
+static void check_normalized_layout(char *output, size_t output_size,
+                                    const char *layout, const char *expected,
+                                    const char *mode)
+{
+    char result[128];
+
+    describe_group_layout(output, output ? output_size : 0, result, sizeof(result));
+    TEST_CHECK(strcmp(result, expected) == 0);
+    TEST_MSG("%s: '%s' produced '%s', expected '%s'", mode, layout, result, expected);
+}
+
+/*
+ * 'strict' is the default normalization. 'kept' keeps the boundary markers
+ * the input already had, as processor chains do for groups split across
+ * appends.
+ */
+static void check_group_normalization(const char *layout, const char *strict,
+                                      const char *kept)
+{
+    struct flb_log_event_encoder *encoder;
+    struct flb_log_event_encoder *copy;
+    struct flb_mp_chunk_cobj *chunk;
+    struct flb_log_event_decoder *decoder;
+    struct flb_mp_chunk_record *record;
+    char *output;
+    size_t output_size;
+    int flags;
+
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    encode_group_layout(encoder, layout);
+    flags = flb_mp_log_group_boundaries(encoder->output_buffer, encoder->output_length);
+
+    output = NULL;
+    TEST_CHECK(flb_mp_normalize_log_buffer_groups_msgpack(encoder->output_buffer,
+                                                          encoder->output_length,
+                                                          &output, &output_size) == 0);
+    check_normalized_layout(output, output_size, layout, strict, "msgpack strict");
+    flb_free(output);
+
+    output = NULL;
+    TEST_CHECK(flb_mp_normalize_log_buffer_groups(encoder->output_buffer,
+                                                  encoder->output_length,
+                                                  &output, &output_size) == 0);
+    check_normalized_layout(output, output_size, layout, strict, "chunk strict");
+    flb_free(output);
+
+    output = NULL;
+    TEST_CHECK(flb_mp_normalize_log_buffer_groups_msgpack_ex(encoder->output_buffer,
+                                                             encoder->output_length,
+                                                             &output, &output_size,
+                                                             flags) == 0);
+    check_normalized_layout(output, output_size, layout, kept, "msgpack kept");
+    flb_free(output);
+
+    /* the chunk normalizer with the same flags */
+    decoder = flb_log_event_decoder_create(encoder->output_buffer, encoder->output_length);
+    TEST_ASSERT(decoder != NULL);
+    flb_log_event_decoder_read_groups(decoder, FLB_TRUE);
+    copy = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(copy != NULL);
+    chunk = flb_mp_chunk_cobj_create(copy, decoder);
+    TEST_ASSERT(chunk != NULL);
+    while (flb_mp_chunk_cobj_record_next(chunk, &record) == FLB_MP_CHUNK_RECORD_OK) {
+    }
+    TEST_CHECK(flb_mp_chunk_cobj_normalize_groups_ex(chunk, flags) == 0);
+    output = NULL;
+    output_size = 0;
+    if (cfl_list_size(&chunk->records) > 0) {
+        TEST_CHECK(flb_mp_chunk_cobj_encode(chunk, &output, &output_size) == 0);
+    }
+    check_normalized_layout(output, output_size, layout, kept, "chunk kept");
+    flb_free(output);
+    flb_mp_chunk_cobj_destroy(chunk);
+    flb_log_event_encoder_destroy(copy);
+    flb_log_event_decoder_destroy(decoder);
+
+    flb_log_event_encoder_destroy(encoder);
+}
+
+static void test_group_normalization_keeps_append_boundaries(void)
+{
+    /* a group continued in the next append keeps its start when kept */
+    check_group_normalization("S r0 r1", "r0 r1", "S r0 r1");
+    check_group_normalization("S", "", "S");
+    /* records closing a group opened by a previous append keep their end */
+    check_group_normalization("r0 r1 E", "r0 r1", "r0 r1 E");
+    check_group_normalization("r0 E S r1 E S r2", "r0 S r1 E r2", "r0 E S r1 E S r2");
+    /* other stray ends, empty groups and nested open groups are always removed */
+    check_group_normalization("r0 E E S r1 E E r2", "r0 S r1 E r2", "r0 E S r1 E r2");
+    check_group_normalization("S E r0", "r0", "r0");
+    check_group_normalization("S S r0", "r0", "r0");
+    check_group_normalization("S r0 E S E r1", "S r0 E r1", "S r0 E r1");
+    check_group_normalization("S r0 E r1", "S r0 E r1", "S r0 E r1");
+}
+
+static void test_group_boundaries_follow_the_input(void)
+{
+    struct flb_log_event_encoder *encoder;
+    int flags;
+
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    encode_group_layout(encoder, "r0 E S r1 E S r2");
+    flags = flb_mp_log_group_boundaries(encoder->output_buffer, encoder->output_length);
+    TEST_CHECK(flags == (FLB_MP_GROUPS_KEEP_LEADING_END | FLB_MP_GROUPS_KEEP_TRAILING_OPEN));
+    flb_log_event_encoder_destroy(encoder);
+
+    /* a balanced input keeps nothing, whatever a processor removes later */
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    encode_group_layout(encoder, "S r0 E r1");
+    TEST_CHECK(flb_mp_log_group_boundaries(encoder->output_buffer, encoder->output_length) == 0);
+    flb_log_event_encoder_destroy(encoder);
+
+    /* nested open groups are not a single continued group */
+    encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+    TEST_ASSERT(encoder != NULL);
+    encode_group_layout(encoder, "S S r0");
+    TEST_CHECK(flb_mp_log_group_boundaries(encoder->output_buffer, encoder->output_length) == 0);
+    flb_log_event_encoder_destroy(encoder);
+
+    TEST_CHECK(flb_mp_log_group_boundaries(NULL, 0) == 0);
+    TEST_CHECK(flb_mp_log_group_boundaries("\x92\x01", 2) == 0);
+}
+
+TEST_LIST = {
+    {"log_helpers_accept_empty_buffers", test_log_helpers_accept_empty_buffers},
+    {"log_scan_matches_decoder", test_log_scan_matches_decoder},
+    {"log_window_next", test_log_window_next},
+    {"group_normalization_append_boundaries", test_group_normalization_keeps_append_boundaries},
+    {"group_boundaries_follow_the_input", test_group_boundaries_follow_the_input},
+    {"preflight", test_preflight},
+    {"preflight_formats", test_preflight_formats},
+    {"validate_trace_chunk" , test_validate_trace_chunk},
+    {"count"                , test_count},
+    {"map_header"           , test_map_header},
+    {"accessor_keys_remove" , test_accessor_keys_remove},
+    {"accessor_keys_remove_subkey_key" , test_keys_remove_subkey_key},
+    {"accessor_keys_remove_subkey_keys" , test_keys_remove_subkey_keys},
+    {"object_to_cfl_to_msgpack" , test_object_to_cfl_to_msgpack},
+    {"test_remove_sibling_subkeys" , test_remove_sibling_subkeys},
+    { 0 }
+};

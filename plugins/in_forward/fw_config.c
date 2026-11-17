@@ -1,0 +1,253 @@
+/* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
+
+/*  Fluent Bit
+ *  ==========
+ *  Copyright (C) 2015-2026 The Fluent Bit Authors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+#include <stdlib.h>
+#include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_downstream.h>
+#include <fluent-bit/flb_input_plugin.h>
+
+#include "fw.h"
+#include "fw_conn.h"
+#include "fw_config.h"
+
+static void fw_destroy_shared_key(struct flb_in_fw_config *config)
+{
+    if (config->owns_shared_key && config->shared_key) {
+        flb_sds_destroy(config->shared_key);
+    }
+
+    config->shared_key = NULL;
+    config->owns_shared_key = FLB_FALSE;
+}
+
+static int fw_create_empty_shared_key(struct flb_in_fw_config *config,
+                                      struct flb_input_instance *i_ins)
+{
+    flb_sds_t empty_key = flb_sds_create("");
+    if (!empty_key) {
+        flb_plg_error(i_ins, "empty shared_key alloc failed");
+        return -1;
+    }
+    else {
+        if (config->owns_shared_key && config->shared_key) {
+            flb_sds_destroy(config->shared_key);
+        }
+        config->shared_key = empty_key;
+        config->owns_shared_key = FLB_TRUE;
+    }
+
+    return 0;
+}
+
+struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
+{
+    char tmp[16];
+    int ret = -1;
+    int64_t memory_limit;
+    const char *p;
+    struct flb_in_fw_config *config;
+
+    config = flb_calloc(1, sizeof(struct flb_in_fw_config));
+    if (!config) {
+        flb_errno();
+        return NULL;
+    }
+    config->coll_fd = -1;
+    config->workers = 1;
+
+    config->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (config->log_encoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event encoder");
+        fw_config_destroy(config);
+
+        return NULL;
+    }
+
+    config->log_decoder = flb_log_event_decoder_create(NULL, 0);
+
+    if (config->log_decoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event decoder");
+        fw_config_destroy(config);
+
+        return NULL;
+    }
+
+    ret = flb_input_config_map_set(i_ins, (void *)config);
+    if (ret == -1) {
+        flb_plg_error(i_ins, "config map set error");
+        /* values written so far are still owned by the config map */
+        config->tag_prefix = NULL;
+        fw_config_destroy(config);
+        return NULL;
+    }
+
+    /*
+     * The config map owns the strings it writes into the context and
+     * releases them the next time it is applied to the same instance, which
+     * happens once per listener worker (in_fw_worker_init). Keep private
+     * copies of the values used while serving connections so no context is
+     * left pointing to released memory.
+     */
+    if (config->tag_prefix) {
+        config->tag_prefix = flb_sds_create_len(config->tag_prefix,
+                                                flb_sds_len(config->tag_prefix));
+        if (!config->tag_prefix) {
+            flb_plg_error(i_ins, "tag_prefix alloc failed");
+            fw_config_destroy(config);
+            return NULL;
+        }
+    }
+
+    if (config->shared_key) {
+        config->shared_key = flb_sds_create_len(config->shared_key,
+                                                flb_sds_len(config->shared_key));
+        if (!config->shared_key) {
+            flb_plg_error(i_ins, "shared_key alloc failed");
+            fw_config_destroy(config);
+            return NULL;
+        }
+        config->owns_shared_key = FLB_TRUE;
+    }
+
+    p = flb_input_get_property("signal_object_memory_limit", i_ins);
+    if (p != NULL) {
+        memory_limit = flb_utils_size_to_bytes(p);
+        if (memory_limit < 0 || (uint64_t) memory_limit > SIZE_MAX) {
+            flb_plg_error(i_ins, "signal_object_memory_limit must be a positive size");
+            fw_config_destroy(config);
+            return NULL;
+        }
+    }
+    if (config->signal_object_memory_limit < 1024) {
+        flb_plg_error(i_ins, "signal_object_memory_limit must be at least 1024 bytes");
+        fw_config_destroy(config);
+        return NULL;
+    }
+
+    p = flb_input_get_property("msgpack_memory_limit", i_ins);
+    if (p != NULL) {
+        memory_limit = flb_utils_size_to_bytes(p);
+        if (memory_limit < 0 || (uint64_t) memory_limit > SIZE_MAX) {
+            flb_plg_error(i_ins, "msgpack_memory_limit must be zero or a positive size");
+            fw_config_destroy(config);
+            return NULL;
+        }
+    }
+    if (config->msgpack_memory_limit == 0) {
+        /* Leave bounded headroom for compact records and zone rounding. The
+         * floor accommodates initial zones when the receive buffer is small.
+         * This is a default policy, not a worst-case MessagePack size bound. */
+        if (config->buffer_max_size > SIZE_MAX / 16) {
+            flb_plg_error(i_ins, "automatic msgpack_memory_limit overflows; set an explicit size");
+            fw_config_destroy(config);
+            return NULL;
+        }
+        config->msgpack_memory_limit = config->buffer_max_size * 16;
+        if (config->msgpack_memory_limit < 65536) {
+            config->msgpack_memory_limit = 65536;
+        }
+    }
+    flb_plg_debug(i_ins, "MessagePack zone memory limit: %zu bytes",
+                  config->msgpack_memory_limit);
+
+    p = flb_input_get_property("unix_path", i_ins);
+    if (p == NULL) {
+        /* Listen interface (if not set, defaults to 0.0.0.0:24224) */
+        flb_input_net_default_listener("0.0.0.0", 24224, i_ins);
+        config->listen = i_ins->host.listen;
+        snprintf(tmp, sizeof(tmp) - 1, "%d", i_ins->host.port);
+        config->tcp_port = flb_strdup(tmp);
+    }
+    else {
+        /* Unix socket mode */
+        if (config->unix_perm_str) {
+            config->unix_perm = strtol(config->unix_perm_str, NULL, 8) & 07777;
+        }
+    }
+
+    if (!config->unix_path) {
+        flb_debug("[in_fw] Listen='%s' TCP_Port=%s",
+                  config->listen, config->tcp_port);
+    }
+
+    /* Shared Key */
+    if (config->empty_shared_key) {
+        if (fw_create_empty_shared_key(config, i_ins) == -1) {
+            fw_config_destroy(config);
+            return NULL;
+        }
+    }
+
+    /* Self Hostname */
+    p = flb_input_get_property("self_hostname", i_ins);
+    if (p) {
+        config->self_hostname = flb_sds_create(p);
+    }
+    else {
+        config->self_hostname = flb_sds_create("localhost");
+    }
+    return config;
+}
+
+int fw_config_destroy(struct flb_in_fw_config *config)
+{
+    if (config->conn_mutex_initialized == FLB_TRUE) {
+        pthread_mutex_destroy(&config->conn_mutex);
+        config->conn_mutex_initialized = FLB_FALSE;
+    }
+
+    if (config->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(config->log_encoder);
+    }
+
+    if (config->log_decoder != NULL) {
+        flb_log_event_decoder_destroy(config->log_decoder);
+    }
+
+    if (config->coll_fd != -1) {
+        flb_input_collector_delete(config->coll_fd, config->ins);
+
+        config->coll_fd = -1;
+    }
+
+    if (config->listener_registered == FLB_TRUE && config->event_loop != NULL) {
+        mk_event_del(config->event_loop, &config->listener_event);
+        config->listener_registered = FLB_FALSE;
+    }
+
+    if (config->downstream != NULL) {
+        flb_downstream_destroy(config->downstream);
+    }
+
+    if (config->unix_path) {
+        unlink(config->unix_path);
+    }
+    else {
+        flb_free(config->tcp_port);
+    }
+
+    fw_destroy_shared_key(config);
+    flb_sds_destroy(config->tag_prefix);
+    flb_sds_destroy(config->self_hostname);
+
+    flb_free(config);
+
+    return 0;
+}

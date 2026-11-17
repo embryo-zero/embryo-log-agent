@@ -1,0 +1,105 @@
+name: Build packages for master or a tagged release
+
+on:
+  push:
+    branches:
+      - master
+    # Any tag starting with 'v'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-distro-packages-arm64:
+    runs-on: ubuntu-latest
+    name: build arm64 packages
+    strategy:
+      fail-fast: true
+      matrix:
+        format: [ rpm, deb ]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: uraimo/run-on-arch-action@fa1f3e7de95534497266c7265950b5188355fbfb # v3.2.1
+        name: Build the ${{matrix.format}} packages
+        with:
+          arch: aarch64
+          distro: ubuntu_latest
+          run: |
+            apt-get update && \
+            apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            file \
+            rpm \
+            make
+            cmake .
+            echo ${{ matrix.format }} | awk '{print toupper($0)}' | xargs -I{} cpack -G {}
+
+      - name: Store the master package artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.format }}-arm64
+          path: |
+            ./*.${{matrix.format}}
+
+  build-distro-packages-amd64:
+    name: build amd64 packages
+    strategy:
+      fail-fast: true
+      matrix:
+        format: [ rpm, deb ]
+
+    runs-on: [ ubuntu-latest ]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build the ${{matrix.format}} packages
+        run:  |
+          cmake .
+          echo ${{ matrix.format }} | awk '{print toupper($0)}' | xargs -I{} cpack -G {}
+
+      - name: Store the master package artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.format }}-amd64
+          path: |
+            ./*.${{matrix.format}}
+
+  release:
+    name: Create release and upload packages
+    needs:
+      - build-distro-packages-amd64
+      - build-distro-packages-arm64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artefacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: artifacts/
+
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: artifacts
+        shell: bash
+
+      - name: Unstable release on push to master to make it easier to download
+        uses: pyTooling/Actions/releaser@b346408fef88bd4cfda9109149e9ec8338a32b15 # r0
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: 'unstable'
+          rm: true
+          files: |
+            artifacts/**/*
+
+      - name: Release on tag
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*

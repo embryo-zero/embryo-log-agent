@@ -1,0 +1,113 @@
+#!/bin/bash
+set -eux
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+
+# Wrapper script around the actual ones used in CI
+# Intended only for legacy/manual use in event of failure in CI
+# Dependencies: awscli git createrepo-c debsigs aptly rsync gnupg2 python3 curl docker/buildx
+# Following that there are a few things to do:
+# Import the signing key (if signing)
+# gpg --import <private key>
+# gpg --export -a "$GPG_KEY" > /tmp/fluentbit.key
+# rpm --import /tmp/fluentbit.key
+
+export BASE_PATH=${BASE_PATH:-$1}
+if [[ ! -d "$BASE_PATH" ]]; then
+    echo "Specified BASE_PATH is not a directory: $BASE_PATH"
+    exit 1
+fi
+
+export DISABLE_SIGNING=${DISABLE_SIGNING:-false}
+export CREATE_REPO_CMD=${CREATE_REPO_CMD:-}
+export CREATE_REPO_ARGS=${CREATE_REPO_ARGS:--dvp}
+# Must be set for signing
+if [[ "$DISABLE_SIGNING" != "false" ]]; then
+    export GPG_KEY=${GPG_KEY:?}
+fi
+
+# Set these to force a manual S3 sync and update
+# AWS_SYNC=true
+# AWS_S3_BUCKET_RELEASE=packages.fluentbit.io
+# AWS_S3_BUCKET_STAGING=fluentbit-staging
+export AWS_REGION=${AWS_REGION:-us-east-1}
+
+# Manual official-release recovery must meet the same metadata gate as CI.
+# This check reads staging/public files; it does not publish metadata or alter ACLs.
+if [[ "${AWS_SYNC:-false}" != "false" ]]; then
+    RELEASE_VERSION=${RELEASE_VERSION:?Set RELEASE_VERSION to the numeric release version}
+    if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]; then
+        echo "RELEASE_VERSION must be numeric without the v prefix: $RELEASE_VERSION" >&2
+        exit 1
+    fi
+    METADATA_TOOL="$SCRIPT_DIR/../.github/scripts/release_metadata.py"
+    METADATA_DIR=$(mktemp -d)
+    trap 'rm -rf "$METADATA_DIR"' EXIT
+    STAGING_IMAGE=${STAGING_IMAGE:-ghcr.io/fluent/fluent-bit/staging}
+    IMAGE_DIGEST=$(docker buildx imagetools inspect "$STAGING_IMAGE:$RELEASE_VERSION" --format '{{.Manifest.Digest}}')
+    python3 "$METADATA_TOOL" generate --version "$RELEASE_VERSION" \
+        --image "$STAGING_IMAGE@$IMAGE_DIGEST" --directory "$METADATA_DIR/generated"
+    mkdir -p "$METADATA_DIR/staged"
+    for FILE in "fluent-bit-schema-$RELEASE_VERSION.json" "fluent-bit-schema-pretty-$RELEASE_VERSION.json"; do
+        aws s3 cp "s3://${AWS_S3_BUCKET_STAGING:?}/$RELEASE_VERSION/$FILE" "$METADATA_DIR/staged/$FILE" --no-progress
+    done
+    python3 "$METADATA_TOOL" compare --version "$RELEASE_VERSION" \
+        --directory "$METADATA_DIR/staged" --reference-directory "$METADATA_DIR/generated"
+    python3 "$METADATA_TOOL" verify --version "$RELEASE_VERSION" --directory "$METADATA_DIR/staged"
+    python3 "$METADATA_TOOL" verify --version "$RELEASE_VERSION" --directory "$METADATA_DIR/staged" \
+        --github-repository fluent/fluent-bit --attempts 10 --delay 30
+fi
+
+RPM_REPO_PATHS=( "amazonlinux/2" 
+				 "amazonlinux/2023" 
+				 "centos/7" 
+				 "centos/8" 
+				 "centos/9" 
+				 "centos/10" 
+				 "rockylinux/8" 
+				 "rockylinux/9" 
+				 "rockylinux/10" 
+				 "almalinux/8" 
+				 "almalinux/9" 
+				 "almalinux/10"
+				)
+
+if [[ "${AWS_SYNC:-false}" != "false" ]]; then
+    aws s3 sync s3://"${AWS_S3_BUCKET_RELEASE:?}" "${BASE_PATH:?}"
+fi
+
+for RPM_REPO in "${RPM_REPO_PATHS[@]}"; do
+    export RPM_REPO
+
+    if [[ "${AWS_SYNC:-false}" != "false" ]]; then
+        aws s3 sync s3://"${AWS_S3_BUCKET_STAGING:?}/$RPM_REPO" "${BASE_PATH:?}/$RPM_REPO"
+    fi
+
+    /bin/bash -eux "$SCRIPT_DIR/update-yum-repo.sh"
+done
+
+DEB_REPO_PATHS=( "debian/bookworm"
+                 "debian/bullseye"
+                 "debian/buster"
+                 "debian/trixie"
+                 "ubuntu/jammy"
+                 "ubuntu/noble"
+                 "ubuntu/resolute"
+                 "raspbian/bookworm"
+                )
+
+for DEB_REPO in "${DEB_REPO_PATHS[@]}"; do
+    export DEB_REPO
+    if [[ "${AWS_SYNC:-false}" != "false" ]]; then
+        aws s3 sync s3://"${AWS_S3_BUCKET_STAGING:?}/$DEB_REPO" "${BASE_PATH:?}/$DEB_REPO"
+    fi
+    /bin/bash -eux "$SCRIPT_DIR/update-apt-repo.sh"
+done
+
+# Other OS now
+if [[ "${AWS_SYNC:-false}" != "false" ]]; then
+    aws s3 sync s3://"${AWS_S3_BUCKET_STAGING:?}/macos" "${BASE_PATH:?}/macos"
+    aws s3 sync s3://"${AWS_S3_BUCKET_STAGING:?}/windows" "${BASE_PATH:?}/windows"
+
+    # Final review, do not push until checked manually
+    aws s3 sync "${BASE_PATH:?}" s3://"${AWS_S3_BUCKET_RELEASE:?}" --exact-timestamps --dryrun
+fi
